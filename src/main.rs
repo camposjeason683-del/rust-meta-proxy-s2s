@@ -21,6 +21,7 @@ struct IncomingPayload {
     value: Option<f64>,
     currency: Option<String>,
     test_event_code: Option<String>, // Entorno de Pruebas
+    allowed_user_data: Option<Vec<String>>, // Whitelist de variables permitidas
 }
 
 // --- ESTRUCTURAS DE WOOCOMMERCE API ---
@@ -34,6 +35,12 @@ struct WcOrderResponse {
 struct WcBilling {
     email: String,
     phone: String,
+    first_name: String,
+    last_name: String,
+    city: String,
+    state: String,
+    postcode: String,
+    country: String,
 }
 
 // --- ESTRUCTURAS META CAPI ---
@@ -60,10 +67,24 @@ struct UserData {
     em: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ph: Option<Vec<String>>,
+    #[serde(rename = "fn", skip_serializing_if = "Option::is_none")]
+    fn_: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ln: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ct: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    st: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zp: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_id: Option<Vec<String>>,
-    client_ip_address: String,
-    client_user_agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fbp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,9 +150,7 @@ async fn handle_purchase(
         
         // Modo Seguro de Benchmark: Evitar tumbar el servidor PHP de Staging
         if order_id == "ORD_BENCHMARK" {
-            // Simulamos un trabajo ligero
             let _ = hash_sha256("benchmark@test.com", false);
-            // println!("Benchmark procesado en: {:?}", start_time.elapsed());
             return;
         }
 
@@ -142,14 +161,80 @@ async fn handle_purchase(
         match timeout(Duration::from_secs(5), wc_req).await {
             Ok(Ok(res)) if res.status().is_success() => {
                 if let Ok(order_data) = res.json::<WcOrderResponse>().await {
-                    let hash_em = hash_sha256(&order_data.billing.email, false);
-                    let hash_ph = hash_sha256(&order_data.billing.phone, true);
-                    let hash_ext_id = if order_data.customer_id > 0 { hash_sha256(&order_data.customer_id.to_string(), false) } else { hash_sha256(&order_data.billing.email, false) };
+                    let is_allowed = |field: &str| -> bool {
+                        match &payload.allowed_user_data {
+                            Some(list) => list.contains(&field.to_string()),
+                            None => true, // Si no se especifica, se envía todo por defecto (retrocompatibilidad)
+                        }
+                    };
 
-                    let mut user_data = UserData { client_ip_address: client_ip, client_user_agent: user_agent, fbp, fbc, ..Default::default() };
-                    if let Some(em) = hash_em { user_data.em = Some(vec![em]); }
-                    if let Some(ph) = hash_ph { user_data.ph = Some(vec![ph]); }
-                    if let Some(ext) = hash_ext_id { user_data.external_id = Some(vec![ext]); }
+                    let mut user_data = UserData::default();
+
+                    // Parámetros sin encriptar
+                    if is_allowed("client_ip_address") {
+                        user_data.client_ip_address = Some(client_ip);
+                    }
+                    if is_allowed("client_user_agent") {
+                        user_data.client_user_agent = Some(user_agent);
+                    }
+                    if is_allowed("fbp") {
+                        user_data.fbp = fbp;
+                    }
+                    if is_allowed("fbc") {
+                        user_data.fbc = fbc;
+                    }
+
+                    // Parámetros encriptados SHA-256
+                    if is_allowed("em") {
+                        if let Some(em) = hash_sha256(&order_data.billing.email, false) {
+                            user_data.em = Some(vec![em]);
+                        }
+                    }
+                    if is_allowed("ph") {
+                        if let Some(ph) = hash_sha256(&order_data.billing.phone, true) {
+                            user_data.ph = Some(vec![ph]);
+                        }
+                    }
+                    if is_allowed("fn") {
+                        if let Some(first_name) = hash_sha256(&order_data.billing.first_name, false) {
+                            user_data.fn_ = Some(vec![first_name]);
+                        }
+                    }
+                    if is_allowed("ln") {
+                        if let Some(last_name) = hash_sha256(&order_data.billing.last_name, false) {
+                            user_data.ln = Some(vec![last_name]);
+                        }
+                    }
+                    if is_allowed("ct") {
+                        if let Some(city) = hash_sha256(&order_data.billing.city, false) {
+                            user_data.ct = Some(vec![city]);
+                        }
+                    }
+                    if is_allowed("st") {
+                        if let Some(state) = hash_sha256(&order_data.billing.state, false) {
+                            user_data.st = Some(vec![state]);
+                        }
+                    }
+                    if is_allowed("zp") {
+                        if let Some(zip) = hash_sha256(&order_data.billing.postcode, false) {
+                            user_data.zp = Some(vec![zip]);
+                        }
+                    }
+                    if is_allowed("country") {
+                        if let Some(country) = hash_sha256(&order_data.billing.country, false) {
+                            user_data.country = Some(vec![country]);
+                        }
+                    }
+                    if is_allowed("external_id") {
+                        let ext_val = if order_data.customer_id > 0 {
+                            order_data.customer_id.to_string()
+                        } else {
+                            order_data.billing.email.clone()
+                        };
+                        if let Some(ext) = hash_sha256(&ext_val, false) {
+                            user_data.external_id = Some(vec![ext]);
+                        }
+                    }
 
                     let meta_payload = MetaPayload {
                         data: vec![MetaEvent {
@@ -169,7 +254,7 @@ async fn handle_purchase(
                     let req_meta = client.post(&state_clone.meta_url).bearer_auth(&state_clone.meta_api_token).json(&meta_payload).send();
                     let _ = timeout(Duration::from_secs(5), req_meta).await;
                     
-                    println!("ÉXITO: Orden {} enviada a Meta. Tiempo total de procesamiento S2S: {:?}", order_id, start_time.elapsed());
+                    println!("ÉXITO: Orden {} enviada a Meta con filtros de datos. Tiempo S2S: {:?}", order_id, start_time.elapsed());
                 }
             }
             _ => {
