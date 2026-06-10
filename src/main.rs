@@ -22,6 +22,7 @@ struct IncomingPayload {
     currency: Option<String>,
     test_event_code: Option<String>, // Entorno de Pruebas
     allowed_user_data: Option<Vec<String>>, // Whitelist de variables permitidas
+    event_source_url: Option<String>, // URL de la página del evento
 }
 
 // --- ESTRUCTURAS DE WOOCOMMERCE API ---
@@ -29,6 +30,7 @@ struct IncomingPayload {
 struct WcOrderResponse {
     billing: WcBilling,
     customer_id: i64,
+    line_items: Vec<WcLineItem>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -41,6 +43,13 @@ struct WcBilling {
     state: String,
     postcode: String,
     country: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct WcLineItem {
+    product_id: i64,
+    quantity: i64,
+    price: serde_json::Value,
 }
 
 // --- ESTRUCTURAS META CAPI ---
@@ -59,6 +68,8 @@ struct MetaEvent {
     user_data: UserData,
     custom_data: CustomData,
     action_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_source_url: Option<String>,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -99,10 +110,30 @@ struct UserData {
     madid: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Default)]
 struct CustomData {
-    currency: String,
-    value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contents: Option<Vec<MetaContent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_items: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct MetaContent {
+    id: String,
+    quantity: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_price: Option<f64>,
 }
 
 struct AppState {
@@ -244,16 +275,43 @@ async fn handle_purchase(
                         }
                     }
 
+                    let mut contents = Vec::new();
+                    let mut content_ids = Vec::new();
+                    let mut num_items = 0;
+
+                    for item in &order_data.line_items {
+                        let price_f64 = match &item.price {
+                            serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                            serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                            _ => 0.0,
+                        };
+
+                        contents.push(MetaContent {
+                            id: item.product_id.to_string(),
+                            quantity: item.quantity,
+                            item_price: Some(price_f64),
+                        });
+
+                        content_ids.push(item.product_id.to_string());
+                        num_items += item.quantity;
+                    }
+
                     let meta_payload = MetaPayload {
                         data: vec![MetaEvent {
                             event_name: "Purchase".to_string(),
                             event_time: chrono::Utc::now().timestamp(),
                             event_id: order_id.clone(),
                             action_source: "website".to_string(),
+                            event_source_url: payload.event_source_url.clone(),
                             user_data,
                             custom_data: CustomData {
-                                currency: payload.currency.clone().unwrap_or_else(|| "USD".to_string()),
-                                value: payload.value.unwrap_or(0.0),
+                                currency: payload.currency.clone(),
+                                value: payload.value,
+                                content_type: Some("product".to_string()),
+                                content_ids: Some(content_ids),
+                                contents: Some(contents),
+                                num_items: Some(num_items),
+                                order_id: Some(order_id.clone()),
                             },
                         }],
                         test_event_code: payload.test_event_code.clone(),
