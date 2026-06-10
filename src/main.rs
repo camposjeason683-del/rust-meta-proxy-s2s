@@ -89,6 +89,14 @@ struct UserData {
     fbp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fbc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ge: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anon_id: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    madid: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Debug)]
