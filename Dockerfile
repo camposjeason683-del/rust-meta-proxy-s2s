@@ -7,18 +7,20 @@ WORKDIR /app
 COPY Cargo.toml ./
 COPY src ./src
 
-# Compilamos el binario 100% estático
-ENV RUSTFLAGS="-C target-feature=+crt-static"
-RUN cargo build --release
+# Asegurar que el target musl estatico este instalado
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Compilar release optimizado con el target especifico (Esto evita romper proc-macros)
+RUN cargo build --release --target x86_64-unknown-linux-musl
 
 # Etapa 2: Contenedor Scratch (< 5MB final)
 FROM scratch
 
-# Copiar certificados raíz (Requeridos por rustls para conexiones HTTPS a Meta)
+# Copiar certificados raiz (Requeridos por rustls para conexiones HTTPS a Meta)
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-# Copiar el binario estático compilado
-COPY --from=builder /app/target/release/meta-proxy /meta-proxy
+# Copiar el binario compilado (Notar que el path incluye el target musl de nuevo)
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/meta-proxy /meta-proxy
 
 EXPOSE 8080
 ENTRYPOINT ["/meta-proxy"]
