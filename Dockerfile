@@ -1,5 +1,5 @@
 # Etapa 1: Construcción (Usamos musl para enlace estático puro)
-FROM rust:1.77-alpine AS builder
+FROM rust:alpine AS builder
 
 # Instalar musl-dev para compilación en Alpine
 RUN apk add --no-cache musl-dev
