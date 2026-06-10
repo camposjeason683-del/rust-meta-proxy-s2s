@@ -1,0 +1,5 @@
+/target
+**/*.exe
+**/*.ps1
+bench.json
+.env
