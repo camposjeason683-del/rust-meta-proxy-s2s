@@ -23,6 +23,54 @@ struct IncomingPayload {
     test_event_code: Option<String>, // Entorno de Pruebas
     allowed_user_data: Option<Vec<String>>, // Whitelist de variables permitidas
     event_source_url: Option<String>, // URL de la página del evento
+    user_data: Option<IncomingUserData>,
+    custom_data: Option<IncomingCustomData>,
+    api_version: Option<String>,
+    meta_api_token: Option<String>,
+    meta_pixel_id: Option<String>,
+    wc_url: Option<String>,
+    wc_ck: Option<String>,
+    wc_cs: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct IncomingUserData {
+    #[serde(default)]
+    em: Option<Vec<String>>,
+    #[serde(default)]
+    ph: Option<Vec<String>>,
+    #[serde(rename = "fn", default)]
+    fn_: Option<Vec<String>>,
+    #[serde(default)]
+    ln: Option<Vec<String>>,
+    #[serde(default)]
+    ct: Option<Vec<String>>,
+    #[serde(default)]
+    st: Option<Vec<String>>,
+    #[serde(default)]
+    zp: Option<Vec<String>>,
+    #[serde(default)]
+    country: Option<Vec<String>>,
+    #[serde(default)]
+    external_id: Option<Vec<String>>,
+    #[serde(default)]
+    db: Option<Vec<String>>,
+    #[serde(default)]
+    ge: Option<Vec<String>>,
+    #[serde(default)]
+    anon_id: Option<Vec<String>>,
+    #[serde(default)]
+    madid: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct IncomingCustomData {
+    content_name: Option<String>,
+    content_category: Option<String>,
+    content_type: Option<String>,
+    content_ids: Option<Vec<String>>,
+    contents: Option<serde_json::Value>,
+    num_items: Option<i64>,
 }
 
 // --- ESTRUCTURAS DE WOOCOMMERCE API ---
@@ -117,23 +165,19 @@ struct CustomData {
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    content_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    contents: Option<Vec<MetaContent>>,
+    contents: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_items: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
-}
-
-#[derive(Serialize, Debug)]
-struct MetaContent {
-    id: String,
-    quantity: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    item_price: Option<f64>,
 }
 
 struct AppState {
@@ -143,6 +187,8 @@ struct AppState {
     wc_url: String,
     wc_ck: String,
     wc_cs: String,
+    pixel_id: String,
+    default_api_version: String,
 }
 
 fn hash_sha256(data: &str, is_phone: bool) -> Option<String> {
@@ -171,163 +217,259 @@ async fn handle_purchase(
     headers: HeaderMap,
     Json(payload): Json<IncomingPayload>,
 ) -> StatusCode {
-    if payload.event_name.as_deref() != Some("purchase") || payload.event_id.is_none() {
-        return StatusCode::OK;
-    }
+    let event_name_raw = payload.event_name.clone().unwrap_or_else(|| "Purchase".to_string());
+    let event_name_lower = event_name_raw.to_lowercase();
 
-    let order_id = payload.event_id.clone().unwrap();
-    let client_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| "0.0.0.0".to_string());
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let fbp = get_cookie(&headers, "_fbp");
-    let fbc = get_cookie(&headers, "_fbc");
-
-    let client = state.http_client.clone();
-    let state_clone = state.clone();
-
-    tokio::spawn(async move {
-        let start_time = Instant::now();
-        
-        // Modo Seguro de Benchmark: Evitar tumbar el servidor PHP de Staging
-        if order_id == "ORD_BENCHMARK" {
-            let _ = hash_sha256("benchmark@test.com", false);
-            return;
+    if event_name_lower == "purchase" && payload.custom_data.is_none() {
+        // --- PROCESO TRADICIONAL DE COMPRA: CONSULTAR WOOCOMMERCE REST API ---
+        if payload.event_id.is_none() {
+            return StatusCode::OK;
         }
+        let order_id = payload.event_id.clone().unwrap();
+        let client_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| "0.0.0.0".to_string());
+        let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let fbp = get_cookie(&headers, "_fbp");
+        let fbc = get_cookie(&headers, "_fbc");
 
-        let wc_order_id = order_id.replace("ORD_", "");
-        let wc_endpoint = format!("{}/wp-json/wc/v3/orders/{}", state_clone.wc_url, wc_order_id);
-        let wc_req = client.get(&wc_endpoint).basic_auth(&state_clone.wc_ck, Some(&state_clone.wc_cs)).send();
+        let client = state.http_client.clone();
+        let state_clone = state.clone();
 
-        match timeout(Duration::from_secs(5), wc_req).await {
-            Ok(Ok(res)) if res.status().is_success() => {
-                if let Ok(order_data) = res.json::<WcOrderResponse>().await {
-                    let is_allowed = |field: &str| -> bool {
-                        match &payload.allowed_user_data {
-                            Some(list) => list.contains(&field.to_string()),
-                            None => true, // Si no se especifica, se envía todo por defecto (retrocompatibilidad)
-                        }
-                    };
+        tokio::spawn(async move {
+            let start_time = Instant::now();
+            
+            if order_id == "ORD_BENCHMARK" {
+                let _ = hash_sha256("benchmark@test.com", false);
+                return;
+            }
 
-                    let mut user_data = UserData::default();
+            let wc_order_id = order_id.replace("ORD_", "");
+            let wc_url = payload.wc_url.clone().unwrap_or_else(|| state_clone.wc_url.clone());
+            let wc_ck = payload.wc_ck.clone().unwrap_or_else(|| state_clone.wc_ck.clone());
+            let wc_cs = payload.wc_cs.clone().unwrap_or_else(|| state_clone.wc_cs.clone());
+            let wc_endpoint = format!("{}/wp-json/wc/v3/orders/{}", wc_url, wc_order_id);
+            let wc_req = client.get(&wc_endpoint).basic_auth(wc_ck, Some(wc_cs)).send();
 
-                    // Parámetros sin encriptar
-                    if is_allowed("client_ip_address") {
-                        user_data.client_ip_address = Some(client_ip);
-                    }
-                    if is_allowed("client_user_agent") {
-                        user_data.client_user_agent = Some(user_agent);
-                    }
-                    if is_allowed("fbp") {
-                        user_data.fbp = fbp;
-                    }
-                    if is_allowed("fbc") {
-                        user_data.fbc = fbc;
-                    }
-
-                    // Parámetros encriptados SHA-256
-                    if is_allowed("em") {
-                        if let Some(em) = hash_sha256(&order_data.billing.email, false) {
-                            user_data.em = Some(vec![em]);
-                        }
-                    }
-                    if is_allowed("ph") {
-                        if let Some(ph) = hash_sha256(&order_data.billing.phone, true) {
-                            user_data.ph = Some(vec![ph]);
-                        }
-                    }
-                    if is_allowed("fn") {
-                        if let Some(first_name) = hash_sha256(&order_data.billing.first_name, false) {
-                            user_data.fn_ = Some(vec![first_name]);
-                        }
-                    }
-                    if is_allowed("ln") {
-                        if let Some(last_name) = hash_sha256(&order_data.billing.last_name, false) {
-                            user_data.ln = Some(vec![last_name]);
-                        }
-                    }
-                    if is_allowed("ct") {
-                        if let Some(city) = hash_sha256(&order_data.billing.city, false) {
-                            user_data.ct = Some(vec![city]);
-                        }
-                    }
-                    if is_allowed("st") {
-                        if let Some(state) = hash_sha256(&order_data.billing.state, false) {
-                            user_data.st = Some(vec![state]);
-                        }
-                    }
-                    if is_allowed("zp") {
-                        if let Some(zip) = hash_sha256(&order_data.billing.postcode, false) {
-                            user_data.zp = Some(vec![zip]);
-                        }
-                    }
-                    if is_allowed("country") {
-                        if let Some(country) = hash_sha256(&order_data.billing.country, false) {
-                            user_data.country = Some(vec![country]);
-                        }
-                    }
-                    if is_allowed("external_id") {
-                        let ext_val = if order_data.customer_id > 0 {
-                            order_data.customer_id.to_string()
-                        } else {
-                            order_data.billing.email.clone()
-                        };
-                        if let Some(ext) = hash_sha256(&ext_val, false) {
-                            user_data.external_id = Some(vec![ext]);
-                        }
-                    }
-
-                    let mut contents = Vec::new();
-                    let mut content_ids = Vec::new();
-                    let mut num_items = 0;
-
-                    for item in &order_data.line_items {
-                        let price_f64 = match &item.price {
-                            serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
-                            serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
-                            _ => 0.0,
+            match timeout(Duration::from_secs(5), wc_req).await {
+                Ok(Ok(res)) if res.status().is_success() => {
+                    if let Ok(order_data) = res.json::<WcOrderResponse>().await {
+                        let is_allowed = |field: &str| -> bool {
+                            match &payload.allowed_user_data {
+                                Some(list) => list.contains(&field.to_string()),
+                                None => true,
+                            }
                         };
 
-                        contents.push(MetaContent {
-                            id: item.product_id.to_string(),
-                            quantity: item.quantity,
-                            item_price: Some(price_f64),
-                        });
+                        let mut user_data = UserData::default();
 
-                        content_ids.push(item.product_id.to_string());
-                        num_items += item.quantity;
+                        // Parámetros sin encriptar
+                        if is_allowed("client_ip_address") {
+                            user_data.client_ip_address = Some(client_ip);
+                        }
+                        if is_allowed("client_user_agent") {
+                            user_data.client_user_agent = Some(user_agent);
+                        }
+                        if is_allowed("fbp") {
+                            user_data.fbp = fbp;
+                        }
+                        if is_allowed("fbc") {
+                            user_data.fbc = fbc;
+                        }
+
+                        // Parámetros encriptados SHA-256
+                        if is_allowed("em") {
+                            if let Some(em) = hash_sha256(&order_data.billing.email, false) {
+                                user_data.em = Some(vec![em]);
+                            }
+                        }
+                        if is_allowed("ph") {
+                            if let Some(ph) = hash_sha256(&order_data.billing.phone, true) {
+                                user_data.ph = Some(vec![ph]);
+                            }
+                        }
+                        if is_allowed("fn") {
+                            if let Some(first_name) = hash_sha256(&order_data.billing.first_name, false) {
+                                user_data.fn_ = Some(vec![first_name]);
+                            }
+                        }
+                        if is_allowed("ln") {
+                            if let Some(last_name) = hash_sha256(&order_data.billing.last_name, false) {
+                                user_data.ln = Some(vec![last_name]);
+                            }
+                        }
+                        if is_allowed("ct") {
+                            if let Some(city) = hash_sha256(&order_data.billing.city, false) {
+                                user_data.ct = Some(vec![city]);
+                            }
+                        }
+                        if is_allowed("st") {
+                            if let Some(state) = hash_sha256(&order_data.billing.state, false) {
+                                user_data.st = Some(vec![state]);
+                            }
+                        }
+                        if is_allowed("zp") {
+                            if let Some(zip) = hash_sha256(&order_data.billing.postcode, false) {
+                                user_data.zp = Some(vec![zip]);
+                            }
+                        }
+                        if is_allowed("country") {
+                            if let Some(country) = hash_sha256(&order_data.billing.country, false) {
+                                user_data.country = Some(vec![country]);
+                            }
+                        }
+                        if is_allowed("external_id") {
+                            let ext_val = if order_data.customer_id > 0 {
+                                order_data.customer_id.to_string()
+                            } else {
+                                order_data.billing.email.clone()
+                            };
+                            if let Some(ext) = hash_sha256(&ext_val, false) {
+                                user_data.external_id = Some(vec![ext]);
+                            }
+                        }
+
+                        let mut contents = Vec::new();
+                        let mut content_ids = Vec::new();
+                        let mut num_items = 0;
+
+                        for item in &order_data.line_items {
+                            let price_f64 = match &item.price {
+                                serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+                                serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                                _ => 0.0,
+                            };
+
+                            contents.push(serde_json::json!({
+                                "id": item.product_id.to_string(),
+                                "quantity": item.quantity,
+                                "item_price": price_f64,
+                            }));
+
+                            content_ids.push(item.product_id.to_string());
+                            num_items += item.quantity;
+                        }
+
+                        let meta_payload = MetaPayload {
+                            data: vec![MetaEvent {
+                                event_name: "Purchase".to_string(),
+                                event_time: chrono::Utc::now().timestamp(),
+                                event_id: order_id.clone(),
+                                action_source: "website".to_string(),
+                                event_source_url: payload.event_source_url.clone(),
+                                user_data,
+                                custom_data: CustomData {
+                                    currency: payload.currency.clone(),
+                                    value: payload.value,
+                                    content_type: Some("product".to_string()),
+                                    content_ids: Some(content_ids),
+                                    contents: Some(serde_json::Value::Array(contents)),
+                                    num_items: Some(num_items),
+                                    order_id: Some(order_id.clone()),
+                                    ..Default::default()
+                                },
+                            }],
+                            test_event_code: payload.test_event_code.clone(),
+                        };
+
+                        let api_version = payload.api_version.clone().unwrap_or_else(|| state_clone.default_api_version.clone());
+                        let pixel_id = payload.meta_pixel_id.clone().unwrap_or_else(|| state_clone.pixel_id.clone());
+                        let api_token = payload.meta_api_token.clone().unwrap_or_else(|| state_clone.meta_api_token.clone());
+                        let meta_url = format!("https://graph.facebook.com/{}/{}/events", api_version, pixel_id);
+                        let req_meta = client.post(&meta_url).bearer_auth(&api_token).json(&meta_payload).send();
+                        let _ = timeout(Duration::from_secs(5), req_meta).await;
+                        
+                        println!("ÉXITO: Orden {} enviada a Meta con filtros de datos. Tiempo S2S: {:?}", order_id, start_time.elapsed());
                     }
-
-                    let meta_payload = MetaPayload {
-                        data: vec![MetaEvent {
-                            event_name: "Purchase".to_string(),
-                            event_time: chrono::Utc::now().timestamp(),
-                            event_id: order_id.clone(),
-                            action_source: "website".to_string(),
-                            event_source_url: payload.event_source_url.clone(),
-                            user_data,
-                            custom_data: CustomData {
-                                currency: payload.currency.clone(),
-                                value: payload.value,
-                                content_type: Some("product".to_string()),
-                                content_ids: Some(content_ids),
-                                contents: Some(contents),
-                                num_items: Some(num_items),
-                                order_id: Some(order_id.clone()),
-                            },
-                        }],
-                        test_event_code: payload.test_event_code.clone(),
-                    };
-
-                    let req_meta = client.post(&state_clone.meta_url).bearer_auth(&state_clone.meta_api_token).json(&meta_payload).send();
-                    let _ = timeout(Duration::from_secs(5), req_meta).await;
-                    
-                    println!("ÉXITO: Orden {} enviada a Meta con filtros de datos. Tiempo S2S: {:?}", order_id, start_time.elapsed());
+                }
+                _ => {
+                    println!("ERROR: Falló la consulta a WooCommerce para la orden {}. Tiempo transcurrido: {:?}", order_id, start_time.elapsed());
                 }
             }
-            _ => {
-                println!("ERROR: Falló la consulta a WooCommerce para la orden {}. Tiempo transcurrido: {:?}", order_id, start_time.elapsed());
+        });
+    } else {
+        // --- PROCESO GENÉRICO: ENVIAR CUALQUIER OTRO EVENTO (ViewContent, AddToCart, InitiateCheckout, etc.) ---
+        let client_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| "0.0.0.0".to_string());
+        let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let fbp = get_cookie(&headers, "_fbp");
+        let fbc = get_cookie(&headers, "_fbc");
+
+        let client = state.http_client.clone();
+        let state_clone = state.clone();
+
+        tokio::spawn(async move {
+            let start_time = Instant::now();
+            let is_allowed = |field: &str| -> bool {
+                match &payload.allowed_user_data {
+                    Some(list) => list.contains(&field.to_string()),
+                    None => true,
+                }
+            };
+
+            let mut user_data = UserData::default();
+
+            // Rellenar IP, UA y cookies del navegador
+            if is_allowed("client_ip_address") { user_data.client_ip_address = Some(client_ip); }
+            if is_allowed("client_user_agent") { user_data.client_user_agent = Some(user_agent); }
+            if is_allowed("fbp") { user_data.fbp = fbp; }
+            if is_allowed("fbc") { user_data.fbc = fbc; }
+
+            // Rellenar PII si fue enviada en el payload (WordPress ya la manda encriptada si la tiene)
+            if let Some(incoming_user) = &payload.user_data {
+                if is_allowed("em") { user_data.em = incoming_user.em.clone(); }
+                if is_allowed("ph") { user_data.ph = incoming_user.ph.clone(); }
+                if is_allowed("fn") { user_data.fn_ = incoming_user.fn_.clone(); }
+                if is_allowed("ln") { user_data.ln = incoming_user.ln.clone(); }
+                if is_allowed("ct") { user_data.ct = incoming_user.ct.clone(); }
+                if is_allowed("st") { user_data.st = incoming_user.st.clone(); }
+                if is_allowed("zp") { user_data.zp = incoming_user.zp.clone(); }
+                if is_allowed("country") { user_data.country = incoming_user.country.clone(); }
+                if is_allowed("external_id") { user_data.external_id = incoming_user.external_id.clone(); }
+                if is_allowed("db") { user_data.db = incoming_user.db.clone(); }
+                if is_allowed("ge") { user_data.ge = incoming_user.ge.clone(); }
+                if is_allowed("anon_id") { user_data.anon_id = incoming_user.anon_id.clone(); }
+                if is_allowed("madid") { user_data.madid = incoming_user.madid.clone(); }
             }
-        }
-    });
+
+            // Rellenar Custom Data
+            let mut custom_data = CustomData {
+                currency: payload.currency.clone(),
+                value: payload.value,
+                ..Default::default()
+            };
+
+            if let Some(incoming_custom) = &payload.custom_data {
+                custom_data.content_name = incoming_custom.content_name.clone();
+                custom_data.content_category = incoming_custom.content_category.clone();
+                custom_data.content_type = incoming_custom.content_type.clone();
+                custom_data.content_ids = incoming_custom.content_ids.clone();
+                custom_data.contents = incoming_custom.contents.clone();
+                custom_data.num_items = incoming_custom.num_items;
+            }
+
+            let meta_event = MetaEvent {
+                event_name: event_name_raw.clone(),
+                event_time: chrono::Utc::now().timestamp(),
+                event_id: payload.event_id.clone().unwrap_or_else(|| format!("EVENT_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0))),
+                action_source: "website".to_string(),
+                event_source_url: payload.event_source_url.clone(),
+                user_data,
+                custom_data,
+            };
+
+            let meta_payload = MetaPayload {
+                data: vec![meta_event],
+                test_event_code: payload.test_event_code.clone(),
+            };
+
+            let api_version = payload.api_version.clone().unwrap_or_else(|| state_clone.default_api_version.clone());
+            let pixel_id = payload.meta_pixel_id.clone().unwrap_or_else(|| state_clone.pixel_id.clone());
+            let api_token = payload.meta_api_token.clone().unwrap_or_else(|| state_clone.meta_api_token.clone());
+            let meta_url = format!("https://graph.facebook.com/{}/{}/events", api_version, pixel_id);
+            let req_meta = client.post(&meta_url).bearer_auth(&api_token).json(&meta_payload).send();
+            let _ = timeout(Duration::from_secs(5), req_meta).await;
+
+            println!("ÉXITO: Evento '{}' enviado a Meta S2S. Tiempo: {:?}", event_name_raw, start_time.elapsed());
+        });
+    }
 
     StatusCode::OK
 }
@@ -337,7 +479,7 @@ async fn main() {
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let pixel_id = env::var("META_PIXEL_ID").unwrap_or_else(|_| "PIXEL_ID_HERE".to_string());
     let api_token = env::var("META_API_TOKEN").unwrap_or_else(|_| "TOKEN_HERE".to_string());
-    let api_version = env::var("META_API_VERSION").unwrap_or_else(|_| "v19.0".to_string());
+    let api_version = env::var("META_API_VERSION").unwrap_or_else(|_| "v25.0".to_string());
     
     let wc_url = env::var("WC_URL").unwrap_or_else(|_| "https://staging56.despensallena.com".to_string());
     let wc_ck = env::var("WC_CK").unwrap_or_else(|_| "ck_bb41efb3f83efc591d827719e87300e8285e420b".to_string());
@@ -346,7 +488,16 @@ async fn main() {
     let meta_url = format!("https://graph.facebook.com/{}/{}/events", api_version, pixel_id);
     let http_client = Client::builder().pool_idle_timeout(Duration::from_secs(60)).build().unwrap();
 
-    let app_state = Arc::new(AppState { http_client, meta_url, meta_api_token: api_token, wc_url: wc_url.trim_end_matches('/').to_string(), wc_ck, wc_cs });
+    let app_state = Arc::new(AppState {
+        http_client,
+        meta_url,
+        meta_api_token: api_token,
+        wc_url: wc_url.trim_end_matches('/').to_string(),
+        wc_ck,
+        wc_cs,
+        pixel_id,
+        default_api_version: api_version,
+    });
     let app = Router::new().route("/collect", post(handle_purchase)).with_state(app_state);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
 
