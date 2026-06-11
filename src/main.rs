@@ -31,6 +31,8 @@ struct IncomingPayload {
     wc_url: Option<String>,
     wc_ck: Option<String>,
     wc_cs: Option<String>,
+    product_identifier: Option<String>, // Nueva: id, sku, gpf, gla
+    variations_output: Option<bool>,    // Nueva: true/false
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -96,8 +98,10 @@ struct WcBilling {
 #[derive(Deserialize, Debug)]
 struct WcLineItem {
     product_id: i64,
+    variation_id: Option<i64>, // Nueva: ID de la variación
     quantity: i64,
     price: serde_json::Value,
+    sku: Option<String>,       // Nueva: SKU
 }
 
 // --- ESTRUCTURAS META CAPI ---
@@ -338,13 +342,44 @@ async fn handle_purchase(
                                 _ => 0.0,
                             };
 
+                            // Lógica de variación vs producto padre
+                            let variations_out = payload.variations_output.unwrap_or(true);
+                            let resolved_id = if variations_out {
+                                if let Some(v_id) = item.variation_id {
+                                    if v_id > 0 { v_id } else { item.product_id }
+                                } else {
+                                    item.product_id
+                                }
+                            } else {
+                                item.product_id
+                            };
+
+                            // Resolver formato del identificador
+                            let identifier_option = payload.product_identifier.as_deref().unwrap_or("id");
+                            let tracking_id = match identifier_option {
+                                "sku" => {
+                                    if let Some(sku) = &item.sku {
+                                        if !sku.trim().is_empty() {
+                                            sku.clone()
+                                        } else {
+                                            resolved_id.to_string()
+                                        }
+                                    } else {
+                                        resolved_id.to_string()
+                                    }
+                                }
+                                "gpf" => format!("woocommerce_gpf_{}", resolved_id),
+                                "gla" => format!("gla_{}", resolved_id),
+                                _ => resolved_id.to_string(),
+                            };
+
                             contents.push(serde_json::json!({
-                                "id": item.product_id.to_string(),
+                                "id": tracking_id,
                                 "quantity": item.quantity,
                                 "item_price": price_f64,
                             }));
 
-                            content_ids.push(item.product_id.to_string());
+                            content_ids.push(tracking_id);
                             num_items += item.quantity;
                         }
 
@@ -386,7 +421,7 @@ async fn handle_purchase(
             }
         });
     } else {
-        // --- PROCESO GENÉRICO: ENVIAR CUALQUIER OTRO EVENTO (ViewContent, AddToCart, InitiateCheckout, etc.) ---
+        // --- PROCESO GENÉRICO: ENVIAR CUALQUIER OTRO EVENTO (ViewContent, AddToCart, InitiateCheckout, etc., o TestConnection) ---
         let client_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.split(',').next().unwrap_or("").trim().to_string()).unwrap_or_else(|| "0.0.0.0".to_string());
         let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         let fbp = get_cookie(&headers, "_fbp");
